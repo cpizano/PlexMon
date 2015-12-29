@@ -59,11 +59,34 @@ Settings LoadSettings() {
   return settings;
 }
 
+class TopWindow : public plx::Window <TopWindow> {
+public:
+  TopWindow() {
+    create_window(0, WS_POPUP, L"plxmon @ 2015",
+      nullptr, nullptr,
+      10, 10, 0, 0,
+      nullptr, nullptr);
+  }
+
+  LRESULT message_handler(const UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+      case WM_DESTROY: {
+        ::PostQuitMessage(0);
+        return 0;
+      }
+    }
+
+    return ::DefWindowProc(window(), message, wparam, lparam);
+  }
+
+};
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_show) {
 
   try {
     auto settings = LoadSettings();
+
+    TopWindow top_window;
 
     MSG msg = { 0 };
     while (::GetMessage(&msg, NULL, 0, 0)) {
