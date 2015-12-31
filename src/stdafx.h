@@ -11,11 +11,13 @@
 
 #include <shellscalingapi.h>
 #include <shlobj.h>
+#include <stdlib.h>
 #include <string.h>
 #include <array>
 #include <initializer_list>
 #include <cctype>
 #include <iterator>
+#include <list>
 #include <map>
 #include <algorithm>
 #include <utility>
@@ -25,6 +27,8 @@
 #include <memory>
 #include <vector>
 #include <stdarg.h>
+
+const int plex_vista_support = 1;
 #include <windows.h>
 
 
@@ -519,9 +523,22 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::Range  (alias for ItRange<T*>)
+//
+template <typename T>
+using Range = plx::ItRange<T*>;
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::GetAppDataPath
 //
 plx::FilePath GetAppDataPath(bool roaming) ;
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::GetExePath
+//
+plx::FilePath GetExePath() ;
 
 
 
@@ -535,10 +552,7 @@ char* HexASCII(uint8_t byte, char* out) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::Range  (alias for ItRange<T*>)
-//
-template <typename T>
-using Range = plx::ItRange<T*>;
+std::string HexASCIIStr(const plx::Range<const uint8_t>& r, char separator) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -774,7 +788,25 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
-std::string HexASCIIStr(const plx::Range<const uint8_t>& r, char separator) ;
+// plx::CodecException (thrown by some decoders)
+// bytes_ : The 16 bytes or less that caused the issue.
+//
+class CodecException : public plx::Exception {
+  uint8_t bytes_[16];
+  size_t count_;
+
+public:
+  CodecException(int line, const plx::Range<const unsigned char>* br)
+      : Exception(line, "Codec exception"), count_(0) {
+    if (br)
+      count_ = br->CopyToArray(bytes_);
+    PostCtor();
+  }
+
+  std::string bytes() const {
+    return plx::HexASCIIStr(plx::Range<const uint8_t>(bytes_, count_), ',');
+  }
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1049,6 +1081,72 @@ enum class OverflowKind {
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::LinkedBuffers
+//
+class LinkedBuffers {
+  struct Item {
+    size_t size;
+    std::unique_ptr<uint8_t[]> data;
+    Item(size_t size)
+        : size(size), data(new uint8_t[size]) {
+    }
+
+    Item(const Item& other)
+        : size(other.size), data(new uint8_t[size]) {
+      memcpy(data.get(), other.data.get(), size);
+    }
+
+    Item(Item&& other) = delete;
+  };
+
+  typedef std::list<Item> BList;
+
+  BList buffers_;
+  BList::iterator loop_it_;
+
+public:
+  LinkedBuffers() {
+  }
+
+  LinkedBuffers(const LinkedBuffers& other)
+      : buffers_(other.buffers_) {
+  }
+
+  LinkedBuffers(LinkedBuffers&& other) {
+    buffers_.swap(other.buffers_);
+    std::swap(loop_it_, other.loop_it_);
+  }
+
+  plx::Range<uint8_t> new_buffer(size_t size_bytes) {
+    buffers_.emplace_back(size_bytes);
+    auto start = &(buffers_.back().data)[0];
+    return plx::Range<uint8_t>(start, start + size_bytes);
+  }
+
+  void remove_last_buffer() {
+    buffers_.pop_back();
+  }
+
+  void first() {
+    loop_it_ = begin(buffers_);
+  }
+
+  void next() {
+    ++loop_it_;
+  }
+
+  bool done() {
+    return (loop_it_ == end(buffers_));
+  }
+
+  plx::Range<uint8_t> get() {
+    auto start = &(loop_it_->data)[0];
+    return plx::Range<uint8_t>(start, start + loop_it_->size);
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::OverflowException (thrown by some numeric converters)
 // kind_ : Type of overflow, positive or negative.
 //
@@ -1163,34 +1261,6 @@ To(const Src & value) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::CodecException (thrown by some decoders)
-// bytes_ : The 16 bytes or less that caused the issue.
-//
-class CodecException : public plx::Exception {
-  uint8_t bytes_[16];
-  size_t count_;
-
-public:
-  CodecException(int line, const plx::Range<const unsigned char>* br)
-      : Exception(line, "Codec exception"), count_(0) {
-    if (br)
-      count_ = br->CopyToArray(bytes_);
-    PostCtor();
-  }
-
-  std::string bytes() const {
-    return plx::HexASCIIStr(plx::Range<const uint8_t>(bytes_, count_), ',');
-  }
-};
-
-
-///////////////////////////////////////////////////////////////////////////////
-// plx::DecodeString (decodes a json-style encoded string)
-//
-std::string DecodeString(plx::Range<const char>& range) ;
-
-
-///////////////////////////////////////////////////////////////////////////////
 // SkipWhitespace (advances a range as long isspace() is false.
 //
 template <typename T>
@@ -1206,6 +1276,100 @@ SkipWhitespace(const plx::Range<T>& r) {
   }
   return wr;
 }
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::DecodeString (decodes a json-style encoded string)
+//
+std::string DecodeString(plx::Range<const char>& range) ;
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::FilesInfo
+//
+#pragma comment(user, "plex.define=plex_vista_support")
+
+class FilesInfo {
+private:
+  FILE_ID_BOTH_DIR_INFO* info_;
+  plx::LinkedBuffers link_buffs_;
+  mutable bool done_;
+
+private:
+  FilesInfo() : info_(nullptr), done_(false) {}
+  FilesInfo(const FilesInfo&) = delete;
+
+public:
+  static FilesInfo FromDir(plx::File& file, long buffer_hint = 32) {
+    if (file.status() != (plx::File::directory | plx::File::existing))
+      throw plx::IOException(__LINE__, nullptr);
+
+    FilesInfo finf;
+    // |buffer_size| controls the tradeoff between speed and memory use.
+    const size_t buffer_size = buffer_hint * 128;
+
+    plx::Range<unsigned char> data;
+    for (size_t count = 0; ;++count) {
+      data = finf.link_buffs_.new_buffer(buffer_size);
+      if (!::GetFileInformationByHandleEx(
+          file.handle_,
+          count == 0 ? FileIdBothDirectoryRestartInfo: FileIdBothDirectoryInfo,
+          data.start(), plx::To<DWORD>(data.size()))) {
+        if (::GetLastError() != ERROR_NO_MORE_FILES)
+          throw plx::IOException(__LINE__, nullptr);
+        break;
+      }
+    }
+    // The last buffer contains garbage. remove it.
+    finf.link_buffs_.remove_last_buffer();
+    return std::move(finf);
+  }
+
+  FilesInfo(FilesInfo&& other)
+      : link_buffs_(std::move(other.link_buffs_)) {
+    std::swap(info_, other.info_);
+    std::swap(done_, other.done_);
+  }
+
+  void first() {
+    done_ = false;
+    link_buffs_.first();
+    info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
+  }
+
+  void next() {
+    if (!info_->NextEntryOffset) {
+      // last entry of this buffer. Move to next buffer.
+      link_buffs_.next();
+      if (link_buffs_.done()) {
+        done_ = true;
+      } else {
+        info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
+      }
+    } else {
+      info_ =reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(
+          ULONG_PTR(info_) + info_->NextEntryOffset);
+    }
+  }
+
+  bool done() const {
+    return done_;
+  }
+
+  const plx::ItRange<wchar_t*> file_name() const {
+    return plx::ItRange<wchar_t*>(
+      info_->FileName,
+      info_->FileName+ (info_->FileNameLength / sizeof(wchar_t)));
+  }
+
+  long long creation_ns1600() const {
+    return info_->CreationTime.QuadPart;
+  }
+
+  bool is_directory() const {
+    return info_->FileAttributes & FILE_ATTRIBUTE_DIRECTORY? true : false;
+  }
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1231,6 +1395,11 @@ plx::JsonValue JsonFromFile(plx::File& cfile) ;
 ///////////////////////////////////////////////////////////////////////////////
 // plx::UTF16FromUTF8
 std::wstring UTF16FromUTF8(const plx::Range<const uint8_t>& utf8, bool strict) ;
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::UTF8FromUTF16
+std::string UTF8FromUTF16(const plx::Range<const uint16_t>& utf16) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
