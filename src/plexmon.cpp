@@ -6,6 +6,9 @@
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
+const wchar_t job_obj_name[] = L"plxmon@vtx";
+const wchar_t install_pipe[] = L"plxmon@ins";
+
 HINSTANCE ThisModule() {
   return reinterpret_cast<HINSTANCE>(&__ImageBase);
 }
@@ -13,7 +16,8 @@ HINSTANCE ThisModule() {
 enum class HardFailure {
   none,
   bad_config,
-  plex_error
+  plex_error,
+  upgrade
 };
 
 struct AppException {
@@ -37,8 +41,10 @@ void HardfailMsgBox(HardFailure fail, int line) {
 }
 
 struct Settings {
-  std::string dropbox_root;
+  plx::FilePath dropbox_root;
   std::string ping_url;
+
+  Settings(std::wstring dropbox_root) : dropbox_root(dropbox_root) {}
 };
 
 plx::File OpenConfigFile() {
@@ -53,34 +59,20 @@ Settings LoadSettings() {
   if (config.type() != plx::JsonType::OBJECT)
     throw plx::IOException(__LINE__, L"<unexpected json>");
 
-  Settings settings;
-  settings.dropbox_root = config["dropbox_root"].get_string();
-  settings.ping_url = config["ping_url"].get_string();
+  auto db_str = config["dropbox_root"].get_string();
+  Settings settings(plx::UTF16FromUTF8(plx::RangeFromString(db_str).bytes(), true));
   return settings;
 }
 
-std::string& PathComponentToUTF8(plx::Range<const wchar_t> s) {
-  static std::string utf8;
-  utf8.resize(250);
-  // now do the conversion.
-  if (!::WideCharToMultiByte(
-    CP_UTF8, 0,
-    s.start(),
-    plx::To<int>(s.size()),
-    &utf8[0],
-    (int) utf8.size(),
-    NULL, NULL)) {
-    throw plx::CodecException(__LINE__, nullptr);
-  }
-  return utf8;
+std::wstring WideFromString(const std::string& str) {
+  return std::wstring(begin(str), end(str));
 }
 
-
-plx::FilePath FindHighestVersion(const plx::FilePath& dir_path) {
+bool FindHighestVersion(const plx::FilePath& dir_path, plx::Version* ver) {
   auto par = plx::FileParams::Directory_ShareAll();
   plx::File dir = plx::File::Create(dir_path, par, plx::FileSecurity());
   if (!dir.is_valid())
-    return;
+    return false;
 
   plx::Version highest;
 
@@ -89,28 +81,174 @@ plx::FilePath FindHighestVersion(const plx::FilePath& dir_path) {
   for (finf.first(); !finf.done(); finf.next()) {
     if (!finf.is_directory())
       continue;
-
-    auto name = finf.file_name();
-    auto str_ver = PathComponentToUTF8(name);
-    auto version = plx::Version::FromString(plx::RangeFromString(str_ver));
-
-    //if (Version::Compare(version, highest))
-
+    if (finf.file_name().empty())
+      continue;
+    if (finf.file_name()[0] == '.')
+      continue;
+    auto name = plx::StringFromRange(finf.file_name());
+    auto version = plx::Version::FromRange(plx::RangeFromString(name));
+    if (plx::Version::Compare(version, highest) > 0)
+      highest = version;
     ++count_dirs;
   }
 
+  if (!count_dirs)
+    return false;
+
+  *ver = highest;
+  return true;
 }
 
+bool IsDeveloperBuild(const std::string& last_path) {
+  return (last_path == "Debug") || (last_path == "Release");
+}
 
-// Version::FromString(plx::RangeFromLitStr("5.22.3.1124"));
+plx::FilePath PlexmonExe(const plx::FilePath& path) {
+  return path.append(L"plexmon.exe");
+}
 
-void TryUpgrade(Settings* settings) {
+bool ValidPlexmonDir(const plx::FilePath& path) {
+  auto op = plx::FileParams::Read_SharedRead();
+  auto exe = plx::File::Create(PlexmonExe(path), op, plx::FileSecurity());
+  if (!exe.is_valid())
+    return false;
+  auto what = plx::File::Create(path.append(L".what"), op, plx::FileSecurity());
+  if (!what.is_valid())
+    return false;
+  return true;
+}
+
+bool RunPlexmonInstall(const plx::FilePath& path) {
+  plx::ProcessParams pp(false, 0);
+  plx::Process process = plx::Process::Create(PlexmonExe(path), L"--install", pp);
+  return process.is_valid();
+}
+
+void IOCPRunner(plx::CompletionPort* cp, unsigned int timeout) {
+  while (true) {
+    auto res = cp->wait_for_io_op(timeout);
+    if (res != plx::CompletionPort::op_ok)
+      return;
+  }
+}
+
+class NewVersionHandshake : public plx::OverlappedChannelHandler {
+  plx::ServerPipe* srv_pipe_;
+  plx::CompletionPort* cp_;
+  std::thread* th_;
+
+  bool success_;
+
+  struct IPC {
+    uint8_t buf[8];
+    IPC() { memset(buf, 0, sizeof(buf)); }
+
+    void set() { memcpy(buf, "alive001", sizeof(buf)); }
+    bool chk() { return memcmp(buf, "alive001", sizeof(buf)) == 0; }
+  };
+
+public:
+  NewVersionHandshake() 
+    : srv_pipe_(nullptr), cp_(nullptr), th_(nullptr), success_(false) {}
+
+  bool begin_old() {
+    cp_ = new plx::CompletionPort(2);
+    srv_pipe_ = new plx::ServerPipe(plx::ServerPipe::Create(
+        install_pipe, plx::ServerPipe::overlapped));
+    srv_pipe_->associate_cp(cp_, this);
+    th_ = new std::thread(IOCPRunner, cp_, 5000);
+    return srv_pipe_->connect(new IPC());
+  }
+
+  bool end_old() {
+    th_->join();
+    delete th_;
+    delete srv_pipe_;
+    delete cp_;
+    return success_;
+  }
+
+  void cancel_old() {
+    srv_pipe_->disconnect();
+    cp_->release_waiter();
+    end_old();
+  }
+
+  bool start_new() {
+    auto params = plx::FileParams::ReadWrite_SharedRead(OPEN_EXISTING);
+    auto pipe = plx::File::Create(
+      plx::FilePath::for_pipe(install_pipe), params, plx::FileSecurity());
+    IPC ipc;  ipc.set();
+    pipe.write(plx::RangeFromArray(ipc.buf));
+  }
+
+  void OnConnect(plx::OverlappedContext* ovc, unsigned long error) override {
+    if (error)
+      return;
+    auto ipc = reinterpret_cast<IPC*>(ovc->ctx);
+    auto m = plx::RangeFromArray(ipc->buf);
+    if (!srv_pipe_->read(m, ipc))
+      throw AppException(HardFailure::upgrade, __LINE__);
+  }
+
+  void OnRead(plx::OverlappedContext* ovc, unsigned long error) override {
+    if (error)
+      return;
+    auto ipc = reinterpret_cast<IPC*>(ovc->ctx);
+    success_ = ipc->chk();
+    delete ipc;
+    if (!srv_pipe_->disconnect())
+      throw AppException(HardFailure::upgrade, __LINE__);
+    cp_->release_waiter();
+  }
+
+  void OnWrite(plx::OverlappedContext* ovc, unsigned long error) override {
+  }
+};
+
+bool TryUpgrade(Settings* settings) {
   auto str_ver = plx::UTF8FromUTF16(
       plx::RangeFromString(plx::GetExePath().leaf()));
-  if ((str_ver == "Debug") || (str_ver == "Release"))
-    return;
-  auto our_ver = plx::Version::FromString(plx::RangeFromString(str_ver));
+
+  plx::Version our_version = IsDeveloperBuild(str_ver) ?
+      plx::Version(0, 0, 0, 10) :
+      plx::Version::FromRange(plx::RangeFromString(str_ver));
+
+  plx::Version newest_version;
+  auto db_plxmon_path = plx::FilePath(
+      settings->dropbox_root).append(L"vortex\\plexmon");
+  if (!FindHighestVersion(db_plxmon_path, &newest_version))
+    return false;
+
+  if (plx::Version::Compare(newest_version, our_version) <= 0)
+    return false;
+
+  auto new_leaf = WideFromString(newest_version.to_string());
+  plx::FilePath new_db_dir(db_plxmon_path.append(new_leaf));
+
+  if (!ValidPlexmonDir(new_db_dir))
+    return false;
+
+  auto install_dir = plx::GetExePath().parent().append(new_leaf);
+  if (!::CreateDirectoryW(install_dir.raw(), NULL)) {
+    if (::GetLastError() != ERROR_ALREADY_EXISTS)
+      return false;
+  }
+
+  if (!::CopyFileW(PlexmonExe(new_db_dir).raw(),
+                   PlexmonExe(install_dir).raw(), TRUE)) {
+    return false;
+  }
+
+  NewVersionHandshake handshake;
+  handshake.begin_old();
  
+  if (!RunPlexmonInstall(install_dir)) {
+    handshake.cancel_old();
+    return false;
+  }
+
+  return handshake.end_old();
 }
 
 
@@ -130,37 +268,29 @@ public:
         return 0;
       }
     }
-
     return ::DefWindowProc(window(), message, wparam, lparam);
   }
-
 };
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_show) {
-
   try {
     auto settings = LoadSettings();
-    TryUpgrade(&settings);
+    if (TryUpgrade(&settings))
+      return 0;
 
     TopWindow top_window;
-
     MSG msg = { 0 };
     while (::GetMessage(&msg, NULL, 0, 0)) {
       ::TranslateMessage(&msg);
       ::DispatchMessage(&msg);
     }
 
-    // Exit program.
     return (int)msg.wParam;
-
-  }
-  catch (plx::Exception& ex) {
+  } catch (plx::Exception& ex) {
     HardfailMsgBox(HardFailure::plex_error, ex.Line());
-    return 2;
-  }
-  catch (AppException& ex) {
+  } catch (AppException& ex) {
     HardfailMsgBox(ex.failure, ex.line);
-    return 3;
   }
+  return 1;
 }
 

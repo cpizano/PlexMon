@@ -24,6 +24,7 @@
 #include <limits>
 #include <type_traits>
 #include <string>
+#include <thread>
 #include <memory>
 #include <vector>
 #include <stdarg.h>
@@ -79,6 +80,37 @@ public:
     return hr_;
   }
 
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::Kernel32Exception (thrown by kernel32 functions)
+//
+class Kernel32Exception : public plx::Exception {
+public:
+  enum Kind {
+    memory,
+    thread,
+    process,
+    waitable,
+    port,
+    pipe
+  };
+
+  Kernel32Exception(int line, Kind type)
+      : Exception(line, "kernel 32"),
+        error_code_(::GetLastError()),
+        type_(type) {
+    PostCtor();
+  }
+
+  Kind type() const {
+    return type_;
+  }
+
+private:
+  Kind type_;
+  unsigned long error_code_;
 };
 
 
@@ -485,6 +517,10 @@ public:
     return (path_.size() < 2) ? false : drive_impl();
   }
 
+  bool has_spaces() const {
+    return std::string::npos != path_.find(' ');
+  }
+
   const wchar_t* raw() const {
     return path_.c_str();
   }
@@ -810,6 +846,146 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::JobObjEventHandler
+//
+
+class JobObjEventHandler {
+public:
+  virtual void AbnormalExit(unsigned int pid, unsigned long error) = 0;
+  virtual void NormalExit(unsigned int pid, unsigned long status) = 0;
+  virtual void NewProcess(unsigned int pid) = 0;
+  virtual void ActiveCountZero() = 0;
+  virtual void ActiveProcessLimit() = 0;
+  virtual void MemoryLimit(unsigned int pid) = 0;
+  virtual void TimeLimit(unsigned int pid) = 0;
+};
+
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::OverlappedContext
+//
+
+class OvIOHandler {
+public:
+  virtual bool OnCompleted(OVERLAPPED* ov) = 0;
+  virtual bool OnFailure(OVERLAPPED* ov, unsigned long error) = 0;
+};
+
+struct RawGQCPS {
+  unsigned long bytes;
+  ULONG_PTR key;
+  OVERLAPPED* ov;
+};
+
+class CompletionPort {
+  HANDLE port_;
+
+private:
+  CompletionPort() = delete;
+  CompletionPort(const CompletionPort&) = delete;
+  CompletionPort& operator=(const CompletionPort&) = delete;
+
+public:
+
+  explicit CompletionPort(unsigned long concurrent)
+    : port_(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, concurrent)) {
+    if (!port_)
+      throw plx::Kernel32Exception(__LINE__, plx::Kernel32Exception::port);
+  }
+
+  ~CompletionPort() {
+    ::CloseHandle(port_);
+  }
+
+  void add_io_handler(HANDLE handle, OvIOHandler* handler) {
+    auto h = ::CreateIoCompletionPort(handle, port_, ULONG_PTR(handler), 0);
+    if (!h)
+      throw plx::Kernel32Exception(__LINE__, plx::Kernel32Exception::port);;
+  }
+
+  void release_waiter() {
+    ::PostQueuedCompletionStatus(port_, 0, 232, nullptr);
+  }
+
+  HANDLE handle() { return port_; }
+
+  enum WaitResult {
+    op_exit,
+    op_ok,
+    op_timeout,
+    op_error
+  };
+
+  WaitResult wait_for_io_op(unsigned long timeout) {
+    unsigned long bytes;
+    ULONG_PTR key;
+    OVERLAPPED* ov;
+
+    // return  | ov | bytes
+    // ----------------------------------------------------
+    //   false |  0 | na   The call to GQCS failed, and no data was dequeued from the IO port.
+    //                     Usually means wrong parameters.
+    //   false |  x | na   The call to GQCS failed, but data was read or written. There is an
+    //                     error condition on the underlying HANDLE. Usually seen when the other
+    //                     end has been forcibly closed but there's still data in the send or
+    //                     receive queue.
+    //   true  |  0 |  y   Only possible via PostQueuedCompletionStatus(). Can use y or key to
+    //                     communicate condtions.
+    //   true  |  x |  0   End of file for a file HANDLE, or the connection has been gracefully
+    //                     closed (for network connections).
+    //   true  |  x |  y   Sucess. y bytes of data have been transferred.
+
+    if (!::GetQueuedCompletionStatus(port_, &bytes, &key, &ov, timeout)) {
+      if (!ov) {
+        if (::GetLastError() == WAIT_TIMEOUT)
+          return op_timeout;
+        throw plx::IOException(__LINE__, nullptr);
+      } else if (key) {
+        return reinterpret_cast<OvIOHandler*>(
+            key)->OnFailure(ov, ::GetLastError()) ? op_ok : op_error;
+      }
+    } else if (!ov) {
+      return op_exit;
+    } else if (key) {
+      return reinterpret_cast<OvIOHandler*>(key)->OnCompleted(ov) ? op_ok : op_error;
+    }
+    throw plx::IOException(__LINE__, nullptr);
+  }
+
+  WaitResult wait_raw(unsigned long timeout, RawGQCPS* rgqcps) {
+    if (!::GetQueuedCompletionStatus(port_, &rgqcps->bytes,
+                                     &rgqcps->key, &rgqcps->ov, timeout))
+      return  (::GetLastError() == WAIT_TIMEOUT) ? op_timeout : op_error;
+    return  rgqcps->key == 232 ? op_exit : op_ok;
+  }
+
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::JobObjectLimits
+//
+
+class JobObjectLimits {
+  friend class JobObject;
+  void config(HANDLE job) const {
+    // $$ implement.
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::OverflowKind
+//
+enum class OverflowKind {
+  None,
+  Positive,
+  Negative,
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::JsonException
 //
 class JsonException : public plx::Exception {
@@ -1071,13 +1247,43 @@ class JsonValue {
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::OverflowKind
+// plx::OverflowException (thrown by some numeric converters)
+// kind_ : Type of overflow, positive or negative.
 //
-enum class OverflowKind {
-  None,
-  Positive,
-  Negative,
+class OverflowException : public plx::Exception {
+  plx::OverflowKind kind_;
+
+public:
+  OverflowException(int line, plx::OverflowKind kind)
+      : Exception(line, "Overflow"), kind_(kind) {
+    PostCtor();
+  }
+  plx::OverflowKind kind() const { return kind_; }
 };
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::NextInt  integer promotion.
+
+short NextInt(char value) ;
+
+int NextInt(short value) ;
+
+long long NextInt(int value) ;
+
+long long NextInt(long value) ;
+
+long long NextInt(long long value) ;
+
+short NextInt(unsigned char value) ;
+
+int NextInt(unsigned short value) ;
+
+long long NextInt(unsigned int value) ;
+
+long long NextInt(unsigned long value) ;
+
+long long NextInt(unsigned long long value) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1144,46 +1350,6 @@ public:
     return plx::Range<uint8_t>(start, start + loop_it_->size);
   }
 };
-
-
-///////////////////////////////////////////////////////////////////////////////
-// plx::OverflowException (thrown by some numeric converters)
-// kind_ : Type of overflow, positive or negative.
-//
-class OverflowException : public plx::Exception {
-  plx::OverflowKind kind_;
-
-public:
-  OverflowException(int line, plx::OverflowKind kind)
-      : Exception(line, "Overflow"), kind_(kind) {
-    PostCtor();
-  }
-  plx::OverflowKind kind() const { return kind_; }
-};
-
-
-///////////////////////////////////////////////////////////////////////////////
-// plx::NextInt  integer promotion.
-
-short NextInt(char value) ;
-
-int NextInt(short value) ;
-
-long long NextInt(int value) ;
-
-long long NextInt(long value) ;
-
-long long NextInt(long long value) ;
-
-short NextInt(unsigned char value) ;
-
-int NextInt(unsigned short value) ;
-
-long long NextInt(unsigned int value) ;
-
-long long NextInt(unsigned long value) ;
-
-long long NextInt(unsigned long long value) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1279,6 +1445,137 @@ SkipWhitespace(const plx::Range<T>& r) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::JobObjecNotification
+//
+
+class JobObjecNotification {
+  plx::CompletionPort* cp_;
+  plx::JobObjEventHandler* handler_;
+
+  friend class JobObject;
+  void config(HANDLE job) const {
+    if (cp_) {
+      JOBOBJECT_ASSOCIATE_COMPLETION_PORT info = { handler_, cp_->handle() };
+      ::SetInformationJobObject(
+        job, JobObjectAssociateCompletionPortInformation, &info, sizeof(info));
+    }
+  }
+
+public:
+  JobObjecNotification() : cp_(nullptr), handler_(nullptr) {}
+  JobObjecNotification(plx::CompletionPort* cp, JobObjEventHandler* handler)
+    : cp_(cp), handler_(handler) {}
+
+  plx::CompletionPort::WaitResult wait_for_event(unsigned long timeout) {
+    plx::RawGQCPS raw;
+    auto rv = cp_->wait_raw(timeout, &raw);
+    if (rv != plx::CompletionPort::op_ok)
+      return rv;
+    auto handler = reinterpret_cast<JobObjEventHandler*>(raw.key);
+    if (!handler)
+      return plx::CompletionPort::op_error;
+
+    auto pid = plx::To<unsigned int>(reinterpret_cast<UINT_PTR>(raw.ov));
+
+    switch (raw.bytes) {
+      case JOB_OBJECT_MSG_END_OF_JOB_TIME:
+        handler->TimeLimit(pid); break;
+      case JOB_OBJECT_MSG_END_OF_PROCESS_TIME:
+        handler->TimeLimit(pid); break;
+      case JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT:
+        break;
+      case JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO:
+        handler->ActiveCountZero(); break;
+      case JOB_OBJECT_MSG_NEW_PROCESS:
+        handler->NewProcess(pid); break;
+      case JOB_OBJECT_MSG_EXIT_PROCESS:
+        handler->NormalExit(pid, 0); break;
+      case JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS:
+        handler->AbnormalExit(pid, 0); break;
+      case JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT:
+        handler->MemoryLimit(pid); break;
+      case JOB_OBJECT_MSG_JOB_MEMORY_LIMIT:
+        handler->MemoryLimit(pid); break;
+      case JOB_OBJECT_MSG_NOTIFICATION_LIMIT:
+      case JOB_OBJECT_MSG_JOB_CYCLE_TIME_LIMIT:
+      default:
+        break;
+    }
+    return rv;
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::OverlappedContext
+//
+
+struct OverlappedContext : public OVERLAPPED {
+  enum OverlappedOp {
+    none_op,
+    connect_op,
+    read_op,
+    write_op,
+    disconnect_op
+  };
+
+  OverlappedOp operation;
+  void* ctx;
+  plx::Range<uint8_t> data;
+
+  OverlappedContext(OverlappedOp op, void* ctx, plx::Range<uint8_t> data)
+    : OVERLAPPED({}), operation(op), ctx(ctx), data(data) {
+  }
+
+  OverlappedContext(OverlappedOp op, void* ctx)
+    : OVERLAPPED({}), operation(op), ctx(ctx) {
+  }
+
+  ~OverlappedContext() {
+    if (hEvent)
+      ::CloseHandle(hEvent);
+  }
+
+  OverlappedContext(const OverlappedContext&) = delete;
+  OverlappedContext operator=(const OverlappedContext&) = delete;
+
+  size_t number_of_bytes() const {
+    return InternalHigh;
+  }
+
+  size_t status_code() const {
+    return Internal;
+  }
+
+  plx::Range<uint8_t> valid_data() {
+    return plx::Range<uint8_t>(data.start(), number_of_bytes());
+  }
+
+  void make_event() {
+    hEvent = ::CreateEvent(nullptr, true, false, nullptr);
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::OverlappedChannelHandler
+//
+
+class OverlappedChannelHandler {
+public:
+  virtual void OnConnect(plx::OverlappedContext* ovc, unsigned long error) = 0;
+  virtual void OnRead(plx::OverlappedContext* ovc, unsigned long error) = 0;
+  virtual void OnWrite(plx::OverlappedContext* ovc, unsigned long error) = 0;
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::DecodeString (decodes a json-style encoded string)
+//
+std::string DecodeString(plx::Range<const char>& range) ;
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::ParseUnsignedInteger
 //
 
@@ -1292,9 +1589,93 @@ uint64_t ParseUnsignedInt(plx::Range<const uint8_t>& r) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::DecodeString (decodes a json-style encoded string)
+// plx::JobObject
 //
-std::string DecodeString(plx::Range<const char>& range) ;
+
+class JobObject {
+  HANDLE handle_;
+  unsigned long status_;
+
+private:
+  JobObject(HANDLE handle, unsigned long status)
+    : handle_(handle), status_(status) {}
+
+  JobObject(const JobObject&) = delete;
+  JobObject& operator=(const JobObject&) = delete;
+
+public:
+  JobObject() : handle_(0UL) {}
+
+  JobObject(JobObject&& jobo) : handle_(0UL), status_(0UL) {
+    std::swap(jobo.handle_, handle_);
+    std::swap(jobo.status_, status_);
+  }
+
+  ~JobObject() {
+    if (handle_) {
+      if (!::CloseHandle(handle_))
+        __debugbreak();
+    }
+  }
+
+  static JobObject Create(const wchar_t* name,
+    const plx::JobObjectLimits& limits,
+    const plx::JobObjecNotification* notification) {
+    auto job = ::CreateJobObjectW(nullptr, name);
+    auto gle = ::GetLastError();
+    if (!job)
+      return JobObject(0UL, gle);
+
+    if (gle != ERROR_ALREADY_EXISTS) {
+      limits.config(job);
+    }
+    if (notification)
+      notification->config(job);
+    return JobObject(job, gle);
+  }
+
+  unsigned status() const { return status_; }
+
+  bool add_process(HANDLE process) {
+    return ::AssignProcessToJobObject(handle_, process) ? true : false;
+  }
+
+  bool is_valid() const { return handle_ != 0UL; }
+
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::ProcessParams
+//
+
+class ProcessParams {
+  bool inherit_;
+  unsigned long flags_;
+  plx::JobObject* job_;
+  void* env_;
+
+  friend class Process;
+
+public:
+  ProcessParams(bool inherit, unsigned long flags)
+    : inherit_(inherit),
+      flags_(flags),
+      job_(nullptr),
+      env_(nullptr) {
+  }
+
+  void set_enviroment(void* env) { env_ = env; }
+  void set_job(plx::JobObject* job) { job_ = job;  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::ParseJsonValue (converts a JSON string into a JsonValue)
+//
+plx::JsonValue ParseJsonValue(plx::Range<const char>& range);
+
+plx::JsonValue ParseJsonValue(plx::Range<const char>& range) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1386,23 +1767,299 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::ParseJsonValue (converts a JSON string into a JsonValue)
+// plx::ReuseObject
 //
-plx::JsonValue ParseJsonValue(plx::Range<const char>& range);
 
-plx::JsonValue ParseJsonValue(plx::Range<const char>& range) ;
+template <typename T>
+struct ReuseObject {
+  __declspec(thread) static T* th_obj;
+
+  void set(T* obj) {
+    if (th_obj)
+      __debugbreak();
+    th_obj = obj;
+  }
+
+  void reset() {
+    if (th_obj) {
+      delete th_obj;
+      th_obj = nullptr;
+    }
+  }
+
+  template <typename... Args>
+  T* get(Args&&... args) {
+    if (th_obj) {
+      T* t = nullptr;
+      std::swap(t, th_obj);
+      t->~T();
+      return new (t) T(std::forward<Args>(args)...);
+    }
+    return new T(std::forward<Args>(args)...);
+  }
+};
+
+template<typename T>
+__declspec(thread) T* ReuseObject<T>::th_obj = nullptr;
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::OverlappedContext
+//
+
+class ServerPipe : private plx::OvIOHandler {
+  HANDLE pipe_;
+  plx::OverlappedChannelHandler* handler_;
+  plx::ReuseObject<plx::OverlappedContext> reuse_ovc;
+
+private:
+  ServerPipe(const ServerPipe&) = delete;
+  ServerPipe& operator=(const ServerPipe&) = delete;
+
+  explicit ServerPipe(HANDLE pipe) : pipe_(pipe) {
+  }
+
+  bool on_completed_helper(OVERLAPPED* ov, unsigned long error) {
+    if (!handler_)
+      return false;
+    auto ovc = reinterpret_cast<plx::OverlappedContext*>(ov);
+    reuse_ovc.set(ovc);
+
+    switch (ovc->operation) {
+      case plx::OverlappedContext::connect_op:
+        handler_->OnConnect(ovc, error); break;
+      case plx::OverlappedContext::read_op:
+        handler_->OnRead(ovc, error); break;
+      case plx::OverlappedContext::write_op:
+        handler_->OnWrite(ovc, error); break;
+      default:  __debugbreak();
+    }
+
+    reuse_ovc.reset();
+    return true;
+  }
+
+  bool OnCompleted(OVERLAPPED* ov) override {
+    return on_completed_helper(ov, 0);
+  }
+
+  bool OnFailure(OVERLAPPED* ov, unsigned long error) override {
+    return on_completed_helper(ov, error);
+  }
+
+  bool do_async(BOOL s) {
+    if (s)
+      return true;
+    auto gle = ::GetLastError();
+    if (gle == ERROR_IO_PENDING)
+      return true;
+    throw plx::IOException(__LINE__, L"pipe_srv");
+  }
+
+public:
+  ServerPipe()
+      : pipe_(INVALID_HANDLE_VALUE) {
+  }
+
+  ServerPipe(ServerPipe&& other)
+      : pipe_(INVALID_HANDLE_VALUE) {
+    std::swap(other.pipe_, pipe_);
+  }
+
+  ~ServerPipe() {
+    if (pipe_ != INVALID_HANDLE_VALUE)
+      ::CloseHandle(pipe_);
+  }
+
+  enum Options {
+    overlapped = 1,
+    byte_read = 2,
+    byte_write = 4
+  };
+
+  static ServerPipe Create(const wchar_t* name, int options) {
+    auto type = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE;
+    if (options & overlapped) {
+      type |= FILE_FLAG_OVERLAPPED;
+    }
+    auto mode = PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    if (options & byte_write) {
+      mode |= PIPE_TYPE_BYTE;
+    }
+    if (options & byte_read) {
+      mode |= PIPE_READMODE_BYTE;
+    }
+
+    auto timeout_ms = 100UL;
+    auto buf_sz = 4096UL;
+    auto path = plx::FilePath::for_pipe(name);
+    auto pipe = ::CreateNamedPipeW(
+        path.raw(), type, mode, 1, buf_sz, buf_sz, timeout_ms, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE)
+      throw plx::Kernel32Exception(__LINE__, Kernel32Exception::port);
+    return ServerPipe(pipe);
+  }
+
+  void associate_cp(plx::CompletionPort* cp, plx::OverlappedChannelHandler* handler) {
+    handler_ = handler;
+    cp->add_io_handler(pipe_, this);
+  }
+
+  bool connect(void* ctx) {
+    auto ovc = ctx ?
+        reuse_ovc.get(plx::OverlappedContext::connect_op, ctx) : nullptr;
+    return do_async(::ConnectNamedPipe(pipe_, ovc));
+  }
+
+  bool read(plx::Range<uint8_t> buf, void* ctx) {
+    auto ovc = ctx ?
+        reuse_ovc.get(plx::OverlappedContext::read_op, ctx, buf) : nullptr;
+    return do_async(::ReadFile(pipe_, buf.start(), plx::To<DWORD>(buf.size()), NULL, ovc));
+  }
+
+  bool write(plx::Range<uint8_t> buf, void* ctx) {
+    auto ovc = ctx ?
+        reuse_ovc.get(plx::OverlappedContext::write_op, ctx, buf) : nullptr;
+    return do_async(::WriteFile(pipe_, buf.start(), plx::To<DWORD>(buf.size()), NULL, ovc));
+  }
+
+  bool disconnect() {
+    return ::DisconnectNamedPipe(pipe_) ? true : false;
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::JsonFromFile.
+plx::JsonValue JsonFromFile(plx::File& cfile) ;
+
 
 
 ///////////////////////////////////////////////////////////////////////////////
 // plx::StringPrintf  (c-style printf for std strings)
 //
 
-std::string StringPrintf(const char* fmt, ...) ;
+int vsnprintf(char* buffer, size_t size,
+              const char* format, va_list arguments) ;
+
+int vsnprintf(wchar_t* buffer, size_t size,
+              const wchar_t* format, va_list arguments) ;
+
+
+template <typename CH>
+std::basic_string<CH> StringPrintf(const CH* fmt, ...) {
+  int fmt_size = 128;
+  std::unique_ptr<CH> mem;
+
+  va_list args;
+  va_start(args, fmt);
+
+  while (true) {
+    mem.reset(new CH[fmt_size]);
+    int sz = vsnprintf(mem.get(), fmt_size, fmt, args);
+    if (sz < fmt_size)
+      break;
+    fmt_size = sz + 1;
+  }
+
+  va_end(args);
+  return mem.get();
+}
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::JsonFromFile.
-plx::JsonValue JsonFromFile(plx::File& cfile) ;
+// plx::Process
+//
+
+class Process {
+  HANDLE handle_;
+  HANDLE thread_;
+  unsigned long error_;
+
+private:
+  Process(HANDLE handle, HANDLE thread, unsigned long error)
+    : handle_(handle), thread_(thread), error_(error) {
+  }
+
+  Process(const Process&) = delete;
+  Process& operator=(const Process&) = delete;
+
+public:
+  Process() : handle_(0UL), thread_(0UL), error_(NO_ERROR) {}
+
+  Process(Process&& process)
+    : handle_(0), thread_(0), error_(NO_ERROR) {
+    std::swap(process.handle_, handle_);
+    std::swap(process.thread_, thread_);
+    std::swap(process.error_, error_);
+  }
+
+  bool wait_termination(unsigned long millisecs) {
+    if (WAIT_OBJECT_0 == ::WaitForSingleObject(handle_, millisecs)) {
+      ::GetExitCodeProcess(handle_, &error_);
+      return true;
+    }
+    return false;
+  }
+
+  bool kill(unsigned int ret_code) {
+    if (!::TerminateProcess(handle_, ret_code))
+      return false;
+    Process closer(std::move(*this));
+    return true;
+  }
+
+  unsigned long resume() {
+    return ::ResumeThread(thread_);
+  }
+
+  ~Process() {
+    if (handle_) {
+      if (!::CloseHandle(handle_))
+        __debugbreak();
+      if (!::CloseHandle(thread_))
+        __debugbreak();
+    }
+  }
+
+  Process& operator=(Process&& process) {
+    std::swap(process.handle_, handle_);
+    std::swap(process.thread_, thread_);
+  }
+
+  bool is_valid() const { return (handle_ != 0UL) && (thread_ != 0UL); }
+  unsigned long error() const { return error_; }
+
+  static Process Create(const plx::FilePath& path,
+    const std::wstring& args,
+    const plx::ProcessParams& pp) {
+    const wchar_t* fmt = (path.has_spaces()) ? L"\"%s\" %s" : L"%s %s";
+    auto cmd_line = plx::StringPrintf(fmt, path.raw(), args.c_str());
+
+    STARTUPINFO si = { sizeof(si), 0 };
+    PROCESS_INFORMATION pi = {};
+
+    auto flags = pp.job_ ? pp.flags_ | CREATE_SUSPENDED : pp.flags_;
+
+    if (!::CreateProcessW(NULL, &cmd_line[0],
+      nullptr, nullptr,
+      pp.inherit_ ? TRUE : FALSE,
+      flags,
+      pp.env_, nullptr,
+      &si, &pi)) {
+      return Process(0UL, 0UL, ::GetLastError());
+    }
+
+    if (pp.job_) {
+      pp.job_->add_process(pi.hProcess);
+      if ((pp.flags_ & CREATE_SUSPENDED) == 0)
+        ::ResumeThread(pi.hThread);
+    }
+
+    return Process(pi.hProcess, pi.hThread, NO_ERROR);
+  }
+
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1472,7 +2129,7 @@ public:
   int rev() const { return v.rev; }
   int build() const { return v.build; }
 
-  static Version FromString(plx::Range<const uint8_t> r) {
+  static Version FromRange(plx::Range<const uint8_t> r) {
     if (r.empty())
       throw plx::CodecException(__LINE__, nullptr);
 

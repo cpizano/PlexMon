@@ -274,36 +274,6 @@ plx::JsonValue ParseJsonValue(plx::Range<const char>& range) {
   auto r = plx::RangeFromBytes(range.start(), range.size());
   throw plx::CodecException(__LINE__, &r);
 }
-namespace impl_v {
-int vsnprintf(char* buffer, size_t size,
-              const char* format, va_list arguments) {
-  int length = _vsprintf_p(buffer, size, format, arguments);
-  if (length < 0) {
-    if (size > 0)
-      buffer[0] = 0;
-    return _vscprintf_p(format, arguments);
-  }
-  return length;
-}
-}
-std::string StringPrintf(const char* fmt, ...) {
-  int fmt_size = 128;
-  std::unique_ptr<char> mem;
-
-  va_list args;
-  va_start(args, fmt);
-
-  while (true) {
-    mem.reset(new char[fmt_size]);
-    int sz = impl_v::vsnprintf(mem.get(), fmt_size, fmt, args);
-    if (sz < fmt_size)
-      break;
-    fmt_size = sz + 1;
-  }
-
-  va_end(args);
-  return std::string(mem.get());
-}
 plx::JsonValue JsonFromFile(plx::File& cfile) {
   if (!cfile.is_valid())
     throw plx::IOException(__LINE__, L"<json file>");
@@ -315,6 +285,26 @@ plx::JsonValue JsonFromFile(plx::File& cfile) {
   plx::Range<const char> json(reinterpret_cast<char*>(r.start()),
                               reinterpret_cast<char*>(r.end()));
   return plx::ParseJsonValue(json);
+}
+int vsnprintf(char* buffer, size_t size,
+              const char* format, va_list arguments) {
+  int length = _vsprintf_p(buffer, size, format, arguments);
+  if (length < 0) {
+    if (size > 0)
+      buffer[0] = 0;
+    return _vscprintf_p(format, arguments);
+  }
+  return length;
+}
+int vsnprintf(wchar_t* buffer, size_t size,
+              const wchar_t* format, va_list arguments) {
+  int length = _vswprintf_p(buffer, size, format, arguments);
+  if (length < 0) {
+    if (size > 0)
+      buffer[0] = 0;
+    return _vscwprintf_p(format, arguments);
+  }
+  return length;
 }
 std::wstring UTF16FromUTF8(const plx::Range<const uint8_t>& utf8, bool strict) {
   if (utf8.empty())
