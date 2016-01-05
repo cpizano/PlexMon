@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 #include <stdarg.h>
 
@@ -61,6 +62,23 @@ public:
   virtual ~Exception() {}
   const char* Message() const { return message_; }
   int Line() const { return line_; }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::RangeException (thrown by ItRange and others)
+//
+class RangeException : public plx::Exception {
+  void* ptr_;
+public:
+  RangeException(int line, void* ptr)
+      : Exception(line, "Invalid Range"), ptr_(ptr) {
+    PostCtor();
+  }
+
+  void* pointer() const {
+    return ptr_;
+  }
 };
 
 
@@ -182,23 +200,6 @@ public:
     return logical_pix * scale_y_;
   }
 
-};
-
-
-///////////////////////////////////////////////////////////////////////////////
-// plx::RangeException (thrown by ItRange and others)
-//
-class RangeException : public plx::Exception {
-  void* ptr_;
-public:
-  RangeException(int line, void* ptr)
-      : Exception(line, "Invalid Range"), ptr_(ptr) {
-    PostCtor();
-  }
-
-  void* pointer() const {
-    return ptr_;
-  }
 };
 
 
@@ -425,6 +426,13 @@ std::unique_ptr<U[]> HeapRange(ItRange<U*>&r) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::Range  (alias for ItRange<T*>)
+//
+template <typename T>
+using Range = plx::ItRange<T*>;
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::IOException
 // error_code_ : The win32 error code of the last operation.
 // name_ : The file or pipe in question.
@@ -559,10 +567,69 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::Range  (alias for ItRange<T*>)
+// plx::LinkedBuffers
 //
-template <typename T>
-using Range = plx::ItRange<T*>;
+class LinkedBuffers {
+  struct Item {
+    size_t size;
+    std::unique_ptr<uint8_t[]> data;
+    Item(size_t size)
+        : size(size), data(new uint8_t[size]) {
+    }
+
+    Item(const Item& other)
+        : size(other.size), data(new uint8_t[size]) {
+      memcpy(data.get(), other.data.get(), size);
+    }
+
+    Item(Item&& other) = delete;
+  };
+
+  typedef std::list<Item> BList;
+
+  BList buffers_;
+  BList::iterator loop_it_;
+
+public:
+  LinkedBuffers() {
+  }
+
+  LinkedBuffers(const LinkedBuffers& other)
+      : buffers_(other.buffers_) {
+  }
+
+  LinkedBuffers(LinkedBuffers&& other) {
+    buffers_.swap(other.buffers_);
+    std::swap(loop_it_, other.loop_it_);
+  }
+
+  plx::Range<uint8_t> new_buffer(size_t size_bytes) {
+    buffers_.emplace_back(size_bytes);
+    auto start = &(buffers_.back().data)[0];
+    return plx::Range<uint8_t>(start, start + size_bytes);
+  }
+
+  void remove_last_buffer() {
+    buffers_.pop_back();
+  }
+
+  void first() {
+    loop_it_ = begin(buffers_);
+  }
+
+  void next() {
+    ++loop_it_;
+  }
+
+  bool done() {
+    return (loop_it_ == end(buffers_));
+  }
+
+  plx::Range<uint8_t> get() {
+    auto start = &(loop_it_->data)[0];
+    return plx::Range<uint8_t>(start, start + loop_it_->size);
+  }
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -575,6 +642,13 @@ plx::FilePath GetAppDataPath(bool roaming) ;
 // plx::GetExePath
 //
 plx::FilePath GetExePath() ;
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::Hash_FNV1a_64  (nice hash function for strings used by c++ std)
+// for short inputs is about 100 times faster than SHA1 and about 20 times
+// faster for long inputs.
+uint64_t Hash_FNV1a_64(const plx::Range<const uint8_t>& r) ;
 
 
 
@@ -1287,72 +1361,6 @@ long long NextInt(unsigned long long value) ;
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// plx::LinkedBuffers
-//
-class LinkedBuffers {
-  struct Item {
-    size_t size;
-    std::unique_ptr<uint8_t[]> data;
-    Item(size_t size)
-        : size(size), data(new uint8_t[size]) {
-    }
-
-    Item(const Item& other)
-        : size(other.size), data(new uint8_t[size]) {
-      memcpy(data.get(), other.data.get(), size);
-    }
-
-    Item(Item&& other) = delete;
-  };
-
-  typedef std::list<Item> BList;
-
-  BList buffers_;
-  BList::iterator loop_it_;
-
-public:
-  LinkedBuffers() {
-  }
-
-  LinkedBuffers(const LinkedBuffers& other)
-      : buffers_(other.buffers_) {
-  }
-
-  LinkedBuffers(LinkedBuffers&& other) {
-    buffers_.swap(other.buffers_);
-    std::swap(loop_it_, other.loop_it_);
-  }
-
-  plx::Range<uint8_t> new_buffer(size_t size_bytes) {
-    buffers_.emplace_back(size_bytes);
-    auto start = &(buffers_.back().data)[0];
-    return plx::Range<uint8_t>(start, start + size_bytes);
-  }
-
-  void remove_last_buffer() {
-    buffers_.pop_back();
-  }
-
-  void first() {
-    loop_it_ = begin(buffers_);
-  }
-
-  void next() {
-    ++loop_it_;
-  }
-
-  bool done() {
-    return (loop_it_ == end(buffers_));
-  }
-
-  plx::Range<uint8_t> get() {
-    auto start = &(loop_it_->data)[0];
-    return plx::Range<uint8_t>(start, start + loop_it_->size);
-  }
-};
-
-
-///////////////////////////////////////////////////////////////////////////////
 // plx::To  (integer to integer type safe cast)
 //
 
@@ -1424,6 +1432,94 @@ To(const Src & value) {
   return ToCastHelper<std::numeric_limits<Src>::is_signed,
                       std::numeric_limits<Tgt>::is_signed>::cast<Tgt>(value);
 }
+
+
+///////////////////////////////////////////////////////////////////////////////
+// plx::FilesInfo
+//
+#pragma comment(user, "plex.define=plex_vista_support")
+
+class FilesInfo {
+private:
+  FILE_ID_BOTH_DIR_INFO* info_;
+  plx::LinkedBuffers link_buffs_;
+  mutable bool done_;
+
+private:
+  FilesInfo() : info_(nullptr), done_(false) {}
+  FilesInfo(const FilesInfo&) = delete;
+
+public:
+  static FilesInfo FromDir(plx::File& file, long buffer_hint = 32) {
+    if (file.status() != (plx::File::directory | plx::File::existing))
+      throw plx::IOException(__LINE__, nullptr);
+
+    FilesInfo finf;
+    // |buffer_size| controls the tradeoff between speed and memory use.
+    const size_t buffer_size = buffer_hint * 128;
+
+    plx::Range<unsigned char> data;
+    for (size_t count = 0; ;++count) {
+      data = finf.link_buffs_.new_buffer(buffer_size);
+      if (!::GetFileInformationByHandleEx(
+          file.handle_,
+          count == 0 ? FileIdBothDirectoryRestartInfo: FileIdBothDirectoryInfo,
+          data.start(), plx::To<DWORD>(data.size()))) {
+        if (::GetLastError() != ERROR_NO_MORE_FILES)
+          throw plx::IOException(__LINE__, nullptr);
+        break;
+      }
+    }
+    // The last buffer contains garbage. remove it.
+    finf.link_buffs_.remove_last_buffer();
+    return std::move(finf);
+  }
+
+  FilesInfo(FilesInfo&& other)
+      : link_buffs_(std::move(other.link_buffs_)) {
+    std::swap(info_, other.info_);
+    std::swap(done_, other.done_);
+  }
+
+  void first() {
+    done_ = false;
+    link_buffs_.first();
+    info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
+  }
+
+  void next() {
+    if (!info_->NextEntryOffset) {
+      // last entry of this buffer. Move to next buffer.
+      link_buffs_.next();
+      if (link_buffs_.done()) {
+        done_ = true;
+      } else {
+        info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
+      }
+    } else {
+      info_ =reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(
+          ULONG_PTR(info_) + info_->NextEntryOffset);
+    }
+  }
+
+  bool done() const {
+    return done_;
+  }
+
+  const plx::ItRange<wchar_t*> file_name() const {
+    return plx::ItRange<wchar_t*>(
+      info_->FileName,
+      info_->FileName+ (info_->FileNameLength / sizeof(wchar_t)));
+  }
+
+  long long creation_ns1600() const {
+    return info_->CreationTime.QuadPart;
+  }
+
+  bool is_directory() const {
+    return info_->FileAttributes & FILE_ATTRIBUTE_DIRECTORY? true : false;
+  }
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1671,99 +1767,111 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// plx::CmdLine (handles command line arguments)
+//
+
+class CmdLine {
+
+  struct KeyHash {
+    size_t operator()(const plx::Range<const wchar_t>& r) const {
+      return plx::Hash_FNV1a_64(r.const_bytes());
+    }
+  };
+
+  struct KeyEqual {
+    bool operator()(const plx::Range<const wchar_t>& lhs,
+                    const plx::Range<const wchar_t>& rhs) const {
+      return lhs.equals(rhs);
+    }
+  };
+
+  std::unordered_map<plx::Range<const wchar_t>,
+                     plx::Range<const wchar_t>, KeyHash, KeyEqual> opts_;
+  std::vector<plx::Range<const wchar_t>> extra_;
+  plx::Range<const wchar_t> program_;
+
+public:
+  CmdLine(int argc, wchar_t* argv[]) {
+    if (!argc)
+      return;
+
+    int start;
+    auto arg0 = plx::RangeUntilValue<wchar_t>(argv[0], 0);
+    if (is_program(arg0)) {
+      program_ = arg0;
+      start = 1;
+    } else {
+      start = 0;
+    }
+
+    for (int ix = start; ix != argc; ++ix) {
+      auto c_arg = plx::RangeUntilValue<wchar_t>(argv[ix], 0);
+      if (IsOption(c_arg)) {
+        c_arg.advance(2);
+        opts_.insert(NameValue(c_arg));
+      } else {
+        extra_.push_back(c_arg);
+      }
+    }
+  }
+
+  template <size_t count>
+  const bool has_switch(const wchar_t (&str)[count],
+                        plx::Range<const wchar_t>* value = nullptr) const {
+
+    return has_switch(plx::RangeFromLitStr<const wchar_t, count>(str), value);
+  }
+
+  const bool has_switch(const plx::Range<const wchar_t>& name,
+                        plx::Range<const wchar_t>* value = nullptr) const {
+    auto pos = opts_.find(name);
+    bool found = pos != end(opts_);
+    if (value && found) {
+      *value = pos->second;
+      return true;
+    }
+    return found;
+  }
+
+  size_t extra_count() const {
+    return extra_.size();
+  }
+
+  plx::Range<const wchar_t> extra(size_t index) const {
+    if (index >= extra_.size())
+      return plx::Range<wchar_t>();
+    return extra_[index];
+  }
+
+private:
+  bool IsOption(const plx::Range<wchar_t>& r) {
+    if (r.size() < 3)
+      return false;
+    return ((r[0] == '-') && (r[1] == '-') && (r[2] != '-') && (r[2] != '='));
+  }
+
+  bool is_program(const plx::Range<wchar_t>& r) const {
+    // $$$ todo.
+    return false;
+  }
+
+  std::pair<plx::Range<wchar_t>, plx::Range<wchar_t>> NameValue(plx::Range<wchar_t>& r) {
+    size_t pos = 0;
+    if (r.contains(L'=', &pos) && pos < (r.size() - 1))
+      return std::make_pair(
+          plx::Range<wchar_t>(r.start(), r.start() + pos),
+          plx::Range<wchar_t>(r.start() + pos + 1, r.end()));
+    return std::make_pair(r, plx::Range<wchar_t>());
+  }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////
 // plx::ParseJsonValue (converts a JSON string into a JsonValue)
 //
 plx::JsonValue ParseJsonValue(plx::Range<const char>& range);
 
 plx::JsonValue ParseJsonValue(plx::Range<const char>& range) ;
-
-
-///////////////////////////////////////////////////////////////////////////////
-// plx::FilesInfo
-//
-#pragma comment(user, "plex.define=plex_vista_support")
-
-class FilesInfo {
-private:
-  FILE_ID_BOTH_DIR_INFO* info_;
-  plx::LinkedBuffers link_buffs_;
-  mutable bool done_;
-
-private:
-  FilesInfo() : info_(nullptr), done_(false) {}
-  FilesInfo(const FilesInfo&) = delete;
-
-public:
-  static FilesInfo FromDir(plx::File& file, long buffer_hint = 32) {
-    if (file.status() != (plx::File::directory | plx::File::existing))
-      throw plx::IOException(__LINE__, nullptr);
-
-    FilesInfo finf;
-    // |buffer_size| controls the tradeoff between speed and memory use.
-    const size_t buffer_size = buffer_hint * 128;
-
-    plx::Range<unsigned char> data;
-    for (size_t count = 0; ;++count) {
-      data = finf.link_buffs_.new_buffer(buffer_size);
-      if (!::GetFileInformationByHandleEx(
-          file.handle_,
-          count == 0 ? FileIdBothDirectoryRestartInfo: FileIdBothDirectoryInfo,
-          data.start(), plx::To<DWORD>(data.size()))) {
-        if (::GetLastError() != ERROR_NO_MORE_FILES)
-          throw plx::IOException(__LINE__, nullptr);
-        break;
-      }
-    }
-    // The last buffer contains garbage. remove it.
-    finf.link_buffs_.remove_last_buffer();
-    return std::move(finf);
-  }
-
-  FilesInfo(FilesInfo&& other)
-      : link_buffs_(std::move(other.link_buffs_)) {
-    std::swap(info_, other.info_);
-    std::swap(done_, other.done_);
-  }
-
-  void first() {
-    done_ = false;
-    link_buffs_.first();
-    info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
-  }
-
-  void next() {
-    if (!info_->NextEntryOffset) {
-      // last entry of this buffer. Move to next buffer.
-      link_buffs_.next();
-      if (link_buffs_.done()) {
-        done_ = true;
-      } else {
-        info_ = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(link_buffs_.get().start());
-      }
-    } else {
-      info_ =reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(
-          ULONG_PTR(info_) + info_->NextEntryOffset);
-    }
-  }
-
-  bool done() const {
-    return done_;
-  }
-
-  const plx::ItRange<wchar_t*> file_name() const {
-    return plx::ItRange<wchar_t*>(
-      info_->FileName,
-      info_->FileName+ (info_->FileNameLength / sizeof(wchar_t)));
-  }
-
-  long long creation_ns1600() const {
-    return info_->CreationTime.QuadPart;
-  }
-
-  bool is_directory() const {
-    return info_->FileAttributes & FILE_ATTRIBUTE_DIRECTORY? true : false;
-  }
-};
 
 
 ///////////////////////////////////////////////////////////////////////////////

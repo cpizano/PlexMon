@@ -64,6 +64,11 @@ Settings LoadSettings() {
   return settings;
 }
 
+bool MigrateSettings(Settings* settings) {
+  // make config copy and write out new config.
+  return true;
+}
+
 std::wstring WideFromString(const std::string& str) {
   return std::wstring(begin(str), end(str));
 }
@@ -178,8 +183,11 @@ public:
     auto params = plx::FileParams::ReadWrite_SharedRead(OPEN_EXISTING);
     auto pipe = plx::File::Create(
       plx::FilePath::for_pipe(install_pipe), params, plx::FileSecurity());
+    if (!pipe.is_valid())
+      return false;
     IPC ipc;  ipc.set();
-    pipe.write(plx::RangeFromArray(ipc.buf));
+    auto sz = pipe.write(plx::RangeFromArray(ipc.buf));
+    return (sz == sizeof(ipc.buf));
   }
 
   void OnConnect(plx::OverlappedContext* ovc, unsigned long error) override {
@@ -251,6 +259,18 @@ bool TryUpgrade(Settings* settings) {
   return handshake.end_old();
 }
 
+bool InstallSelf() {
+  try {
+    auto settings = LoadSettings();
+    MigrateSettings(&settings);
+  }
+  catch (plx::Exception&) {
+    return false;
+  }
+
+  NewVersionHandshake handshake;
+  return handshake.start_new();
+}
 
 class TopWindow : public plx::Window <TopWindow> {
 public:
@@ -272,11 +292,61 @@ public:
   }
 };
 
+class JobObjHandler : public plx::JobObjEventHandler {
+public:
+  std::vector<unsigned int> new_pids;
+  std::vector<unsigned int> dead_pids;
+
+  void AbnormalExit(unsigned int pid, unsigned long error) override {
+    dead_pids.push_back(pid);
+  }
+  void NormalExit(unsigned int pid, unsigned long status) override {
+    dead_pids.push_back(pid);
+  }
+  void NewProcess(unsigned int pid) override {
+    new_pids.push_back(pid);
+  }
+  void ActiveCountZero() override {
+  }
+  void ActiveProcessLimit() override {
+  }
+  void MemoryLimit(unsigned int pid) {
+  }
+  void TimeLimit(unsigned int pid) {
+  }
+};
+
+void JobThread(plx::CompletionPort* cp) {
+  JobObjHandler job_handler;
+  plx::JobObjecNotification runner(cp, &job_handler);
+
+  plx::JobObject job = plx::JobObject::Create(
+      job_obj_name, plx::JobObjectLimits(),&runner);
+
+  while (true) {
+    auto rv = runner.wait_for_event(INFINITE);
+    if (rv == plx::CompletionPort::op_exit)
+      break;
+  }
+}
+
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_show) {
   try {
+    int argc = 0;
+    auto argv = CommandLineToArgvW(cmdline, &argc);
+    plx::CmdLine cmd(argc, argv);
+
+    if (cmd.has_switch(L"install")) {
+      if (!InstallSelf())
+        return 0;
+    }
+
     auto settings = LoadSettings();
     if (TryUpgrade(&settings))
       return 0;
+
+    plx::CompletionPort job_cp(1);
+    std::thread job_thread(JobThread, &job_cp);
 
     TopWindow top_window;
     MSG msg = { 0 };
@@ -284,6 +354,9 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_
       ::TranslateMessage(&msg);
       ::DispatchMessage(&msg);
     }
+
+    job_cp.release_waiter();
+    job_thread.join();
 
     return (int)msg.wParam;
   } catch (plx::Exception& ex) {
