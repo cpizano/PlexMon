@@ -1,4 +1,4 @@
-// plexmon.cpp : Defines the entry point for the application.
+// plexmon.cpp.
 //
 
 #include "stdafx.h"
@@ -13,19 +13,6 @@ HINSTANCE ThisModule() {
   return reinterpret_cast<HINSTANCE>(&__ImageBase);
 }
 
-enum class HardFailure {
-  none,
-  bad_config,
-  plex_error,
-  upgrade
-};
-
-struct AppException {
-  HardFailure failure;
-  int line;
-  AppException(HardFailure failure, int line) : failure(failure), line(line) {}
-};
-
 void HardfailMsgBox(HardFailure fail, int line) {
   const char* err = nullptr;
   switch (fail) {
@@ -37,7 +24,7 @@ void HardfailMsgBox(HardFailure fail, int line) {
 
   auto err_text = plx::StringPrintf("Exception [%s]\nLine: %d", err, line);
   auto full_err = plx::UTF16FromUTF8(plx::RangeFromString(err_text), true);
-  ::MessageBox(NULL, full_err.c_str(), L"CamCenter", MB_OK | MB_ICONEXCLAMATION);
+  ::MessageBox(NULL, full_err.c_str(), L"plexmon", MB_OK | MB_ICONEXCLAMATION);
 }
 
 struct Settings {
@@ -331,15 +318,24 @@ void JobThread(plx::CompletionPort* cp) {
 }
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_show) {
+  int rv = 0;
+
   try {
     int argc = 0;
     auto argv = CommandLineToArgvW(cmdline, &argc);
     plx::CmdLine cmd(argc, argv);
 
+    Log::init(L"vortex\\plexmon\\init_log.txt");
+
     if (cmd.has_switch(L"install")) {
-      if (!InstallSelf())
+      if (!InstallSelf()) {
+        Log::close();
         return 0;
+      }
     }
+
+    Log::close();
+    Log::init(L"vortex\\plexmon\\op_log.txt");
 
     auto settings = LoadSettings();
     if (TryUpgrade(&settings))
@@ -358,12 +354,13 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_
     job_cp.release_waiter();
     job_thread.join();
 
-    return (int)msg.wParam;
+    rv = (int) msg.wParam;
   } catch (plx::Exception& ex) {
     HardfailMsgBox(HardFailure::plex_error, ex.Line());
   } catch (AppException& ex) {
     HardfailMsgBox(ex.failure, ex.line);
   }
-  return 1;
-}
 
+  Log::close();
+  return rv;
+}
