@@ -13,15 +13,15 @@ HINSTANCE ThisModule() {
   return reinterpret_cast<HINSTANCE>(&__ImageBase);
 }
 
-void HardfailMsgBox(HardFailure fail, int line) {
-  const char* err = nullptr;
-  switch (fail) {
-    case HardFailure::none: err = "none"; break;
-    case HardFailure::bad_config: err = "bad config"; break;
-    case HardFailure::plex_error: err = "plex error"; break;
-    default: err = "(??)"; break;
-  }
+struct AppException {
+  HardFailure failure;
+  int line;
+  AppException(HardFailure failure, int line) : failure(failure), line(line) {}
+};
 
+void HardfailMsgBox(HardFailure fail, int line) {
+  auto err = ToString(fail);
+  Log::hard_fail(fail, line);
   auto err_text = plx::StringPrintf("Exception [%s]\nLine: %d", err, line);
   auto full_err = plx::UTF16FromUTF8(plx::RangeFromString(err_text), true);
   ::MessageBox(NULL, full_err.c_str(), L"plexmon", MB_OK | MB_ICONEXCLAMATION);
@@ -63,8 +63,10 @@ std::wstring WideFromString(const std::string& str) {
 bool FindHighestVersion(const plx::FilePath& dir_path, plx::Version* ver) {
   auto par = plx::FileParams::Directory_ShareAll();
   plx::File dir = plx::File::Create(dir_path, par, plx::FileSecurity());
-  if (!dir.is_valid())
+  if (!dir.is_valid()) {
+    Log::soft_fail(SoftFailure::invalid_dir, __LINE__);
     return false;
+  }
 
   plx::Version highest;
 
@@ -76,6 +78,8 @@ bool FindHighestVersion(const plx::FilePath& dir_path, plx::Version* ver) {
     if (finf.file_name().empty())
       continue;
     if (finf.file_name()[0] == '.')
+      continue;
+    if (std::isalpha(finf.file_name()[0]))
       continue;
     auto name = plx::StringFromRange(finf.file_name());
     auto version = plx::Version::FromRange(plx::RangeFromString(name));
@@ -102,15 +106,19 @@ plx::FilePath PlexmonExe(const plx::FilePath& path) {
 bool ValidPlexmonDir(const plx::FilePath& path) {
   auto op = plx::FileParams::Read_SharedRead();
   auto exe = plx::File::Create(PlexmonExe(path), op, plx::FileSecurity());
-  if (!exe.is_valid())
+  if (!exe.is_valid()) {
+    Log::soft_fail(SoftFailure::invalid_file, __LINE__);
     return false;
+  }
   auto what = plx::File::Create(path.append(L".what"), op, plx::FileSecurity());
-  if (!what.is_valid())
+  if (!what.is_valid()) {
+    Log::soft_fail(SoftFailure::invalid_file, __LINE__);
     return false;
+  }
   return true;
 }
 
-bool RunPlexmonInstall(const plx::FilePath& path) {
+bool LaunchPlexmonInstall(const plx::FilePath& path) {
   plx::ProcessParams pp(false, 0);
   plx::Process process = plx::Process::Create(PlexmonExe(path), L"--install", pp);
   return process.is_valid();
@@ -201,13 +209,17 @@ public:
   }
 };
 
-bool TryUpgrade(Settings* settings) {
-  auto str_ver = plx::UTF8FromUTF16(
-      plx::RangeFromString(plx::GetExePath().leaf()));
+plx::Version GetSelfVersion() {
+  static std::string str_ver = plx::UTF8FromUTF16(
+    plx::RangeFromString(plx::GetExePath().leaf()));
 
-  plx::Version our_version = IsDeveloperBuild(str_ver) ?
-      plx::Version(0, 0, 0, 10) :
-      plx::Version::FromRange(plx::RangeFromString(str_ver));
+  return IsDeveloperBuild(str_ver) ?
+    plx::Version(0, 0, 0, 10) :
+    plx::Version::FromRange(plx::RangeFromString(str_ver));
+}
+
+bool TryUpgrade(Settings* settings) {
+  auto our_version = GetSelfVersion();
 
   plx::Version newest_version;
   auto db_plxmon_path = plx::FilePath(
@@ -218,6 +230,8 @@ bool TryUpgrade(Settings* settings) {
   if (plx::Version::Compare(newest_version, our_version) <= 0)
     return false;
 
+  Log::newer_found(newest_version);
+
   auto new_leaf = WideFromString(newest_version.to_string());
   plx::FilePath new_db_dir(db_plxmon_path.append(new_leaf));
 
@@ -226,37 +240,52 @@ bool TryUpgrade(Settings* settings) {
 
   auto install_dir = plx::GetExePath().parent().append(new_leaf);
   if (!::CreateDirectoryW(install_dir.raw(), NULL)) {
-    if (::GetLastError() != ERROR_ALREADY_EXISTS)
+    if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+      Log::soft_fail(SoftFailure::create_failed, __LINE__);
       return false;
+    }
   }
 
   if (!::CopyFileW(PlexmonExe(new_db_dir).raw(),
                    PlexmonExe(install_dir).raw(), TRUE)) {
+    Log::soft_fail(SoftFailure::copy_failed, __LINE__);
     return false;
   }
 
   NewVersionHandshake handshake;
   handshake.begin_old();
  
-  if (!RunPlexmonInstall(install_dir)) {
+  if (!LaunchPlexmonInstall(install_dir)) {
     handshake.cancel_old();
+    Log::soft_fail(SoftFailure::launch_failed, __LINE__);
     return false;
   }
 
-  return handshake.end_old();
+  if (!handshake.end_old()) {
+    Log::soft_fail(SoftFailure::timed_out, __LINE__);
+    return false;
+  }
+  return true;
 }
 
 bool InstallSelf() {
+  Log::init(L"vortex\\plexmon\\install_log.txt");
+  Log::installing(GetSelfVersion());
+
   try {
     auto settings = LoadSettings();
     MigrateSettings(&settings);
   }
-  catch (plx::Exception&) {
+  catch (plx::Exception& ex) {
+    Log::soft_fail(SoftFailure::pxl_exception, ex.Line());
+    Log::close();
     return false;
   }
 
   NewVersionHandshake handshake;
-  return handshake.start_new();
+  auto rv = handshake.start_new();
+  Log::close();
+  return rv;
 }
 
 class TopWindow : public plx::Window <TopWindow> {
@@ -325,16 +354,12 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_
     auto argv = CommandLineToArgvW(cmdline, &argc);
     plx::CmdLine cmd(argc, argv);
 
-    Log::init(L"vortex\\plexmon\\init_log.txt");
-
     if (cmd.has_switch(L"install")) {
       if (!InstallSelf()) {
-        Log::close();
         return 0;
       }
     }
 
-    Log::close();
     Log::init(L"vortex\\plexmon\\op_log.txt");
 
     auto settings = LoadSettings();
@@ -355,11 +380,13 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int cmd_
     job_thread.join();
 
     rv = (int) msg.wParam;
-  } catch (plx::Exception& ex) {
-    HardfailMsgBox(HardFailure::plex_error, ex.Line());
-  } catch (AppException& ex) {
+  }
+  catch (AppException& ex) {
     HardfailMsgBox(ex.failure, ex.line);
   }
+  catch (plx::Exception& ex) {
+    HardfailMsgBox(HardFailure::plex_throw, ex.Line());
+  } 
 
   Log::close();
   return rv;
