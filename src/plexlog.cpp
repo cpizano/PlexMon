@@ -2,6 +2,8 @@
 //
 
 #include "stdafx.h"
+
+#include <time.h>
 #include "plexmon.h"
 
 #define spf plx::StringPrintf
@@ -49,6 +51,14 @@ public:
     file_.write(plx::RangeFromString(line));
   }
 
+  void add_now_readable() {
+    time_t ltime;
+    time(&ltime);
+    char buf[26];
+    ctime_s(buf, sizeof(buf), &ltime);
+    add(buf);
+  }
+
   unsigned long ts() const {
     auto d = ::GetTickCount64() - tick_;
     return static_cast<unsigned long>(d / 100);
@@ -64,7 +74,8 @@ void Log::init(const wchar_t * name) {
   auto appdata_path = plx::GetAppDataPath(false);
   auto path = appdata_path.append(name);
   elg = new Logger(path);
-  elg->add("\n@ plex log <plexmon> [0.1] " __DATE__ "\n");
+  elg->add("\n@ plex log <plexmon> [0.1] " __DATE__ " now : ");
+  elg->add_now_readable();
   elg->add(spf("%lu pid %d tid %d tick %llu\n", elg->ts(),
       ::GetCurrentProcessId(), ::GetCurrentThreadId(), ::GetTickCount64()));
 }
